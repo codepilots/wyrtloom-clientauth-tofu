@@ -20,9 +20,10 @@ distinct from the human user.
 
 2. **Enroll (first contact).** The client presents the bootstrap key plus its
    ed25519 **public key**. The server validates the key (hash + constant-time
-   compare against an unconsumed record), marks it consumed, and **pins** the
-   public key (TOFU). Only the public key and its SHA-256 fingerprint are stored —
-   never a recoverable secret.
+   compare against the issued record), then **atomically consumes it** via the
+   persistence layer's compare-and-set so the key is single-use even across
+   processes sharing the store, and **pins** the public key (TOFU). Only the public
+   key and its SHA-256 fingerprint are stored — never a recoverable secret.
 
    ```rust
    let cred = scheme.enroll(EnrollmentRequest {
@@ -78,9 +79,14 @@ build byte-identical signed bytes and field-boundary confusion is impossible.
 
 - Asymmetric only; the store holds only the public key + fingerprint.
 - Single-use CSPRNG (≥128-bit) bootstrap keys, stored hashed, constant-time
-  compared.
+  compared. Single-use is **cross-process atomic**: redemption is settled by the
+  persistence layer's `put_if_absent` compare-and-set (an atomic consume marker),
+  so instances sharing one store cannot double-redeem a key. The per-request replay
+  cache remains process-local — run a single instance for cross-instance replay
+  protection (see `SECURITY.md`).
 - Length-prefixed, domain-separated canonicalization.
-- Bounded ±skew replay window with nonce eviction (cache is O(window·rate)).
+- Bounded ±skew replay window with nonce eviction (cache is O(window·rate),
+  process-local).
 - TOFU rejects key changes (`PinMismatch`).
 - ed25519 and ECDSA P-256 supported; P-256 signatures must be canonical low-s
   (anti-malleability) — see "Signing requirements" above.

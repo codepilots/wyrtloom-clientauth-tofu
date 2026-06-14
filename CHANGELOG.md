@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Security (bootstrap single-use is now cross-process atomic): `consume_bootstrap_key`
+  no longer does a get-then-put on a `consumed` flag made atomic only by the in-process
+  `enroll_lock`. After confirming the key was issued (constant-time hash compare), it
+  claims single-use with an atomic `put_if_absent` consume marker in a new
+  `consumed_bootstrap_keys` collection (the sqlite store implements this as a single
+  `INSERT … ON CONFLICT DO NOTHING` under WAL). Two processes sharing one store can no
+  longer double-redeem a key; correctness no longer depends on the process lock (which
+  remains only as belt-and-suspenders for the in-process TOFU-pin check). The `consumed`
+  field was removed from `StoredBootstrapKey`. Adds `bootstrap_key_single_use_across_processes`
+  (two independent `TofuClientAuth` instances, separate connections to one shared on-disk
+  WAL store, racing the same key → exactly one succeeds).
+  Note: this crate is pre-release, so there is no on-disk data in the prior
+  `consumed`-flag format; the new marker collection is the sole source of truth from the
+  start and no data migration is required.
+
 - Security (P-256 signature malleability): `verify_signature` now rejects
   non-canonical (high-s) ECDSA signatures via `normalize_s()`, so a captured
   signature cannot be malleated into a second valid one (`(r, s)` / `(r, n-s)`).

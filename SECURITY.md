@@ -29,15 +29,16 @@ bootstrap-key issuance/consumption, timestamp freshness, and replay/nonce defens
   enrollment (see Gotchas).
 - **Transport confidentiality/integrity** — there is no TLS here; canonicalization
   binds the request but does not hide it.
-- **Cross-process / multi-instance coordination** — the replay cache and the
-  single-use enroll lock are process-local (see Gotchas, Operational requirements).
+- **Cross-process replay-cache coordination** — the per-request replay/nonce cache
+  is process-local (see Gotchas, Operational requirements). Bootstrap-key
+  single-use, by contrast, is now **cross-process atomic** via the persistence
+  layer's compare-and-set (see Bootstrap keys), so it is *not* in this exclusion.
 
 ## Security mechanisms
 
 ### Asymmetric TOFU pinning
 On first contact, the client presents a bootstrap key plus its public key; the server
-validates the key, marks it consumed, and **pins** the public key (`enroll`, lines
-421–503). The pin is keyed by `client_id`, which is derived as
+validates the key, atomically consumes it, and **pins** the public key (`enroll`). The pin is keyed by `client_id`, which is derived as
 `client_id == fingerprint == SHA-256(public_key)` (lines 435–438). Because the id is
 the hash of the key, forging a colliding id for a *different* key requires breaking
 SHA-256 second-preimage resistance. Re-enrolling the same id with the same key is
@@ -66,19 +67,33 @@ message. `verify_signature` rejects any signature for which `normalize_s()` retu
 `p256_webcrypto_client_enrolls_and_verifies` (lines 699–742) cover this.
 
 ### Bootstrap keys
-`issue_bootstrap_key` (lines 304–326) draws **256 bits** from the OS CSPRNG
-(`OsRng.fill_bytes` into a 32-byte buffer, lines 305–307), hex-encodes the plaintext,
-stores only its **SHA-256 hash** with `consumed: false` (`StoredBootstrapKey`, lines
-164–171), and returns the plaintext **once** for out-of-band distribution.
-`consume_bootstrap_key` (lines 330–366) looks up by hash, **constant-time compares**
-the stored hash against the recomputed hash (`ct_eq`, lines 343–347), and rejects a
-mismatched **or already-consumed** key as `BadApiKey` (lines 348–350). On success it
-writes back `consumed: true` (lines 352–364). The check-then-consume is serialized by
-the process `enroll_lock` mutex held across the whole tail of `enroll` (lines
-440–476, lock defined lines 250–255), making it atomic within the process. Tests:
-`bootstrap_key_is_single_use` (lines 677–697), `unknown_or_garbage_bootstrap_key_rejected`
-(lines 803–815), `bootstrap_key_single_use_under_concurrency` (8 threads, exactly one
-success — lines 1152–1185).
+`issue_bootstrap_key` draws **256 bits** from the OS CSPRNG (`OsRng.fill_bytes` into a
+32-byte buffer), hex-encodes the plaintext, stores only its **SHA-256 hash** (an
+issuance record in `bootstrap_keys`), and returns the plaintext **once** for
+out-of-band distribution.
+
+`consume_bootstrap_key` enforces single-use in two steps:
+
+1. **Issued-check (constant-time).** It looks up the key's hash id in
+   `bootstrap_keys` and **constant-time compares** (`ct_eq`) the stored hash against
+   the recomputed hash, rejecting a never-issued or mismatched key as `BadApiKey`.
+2. **Atomic consume marker (compare-and-set).** It then calls
+   `PersistenceProvider::put_if_absent` to insert a consume marker keyed by that hash
+   into the `consumed_bootstrap_keys` collection. `Ok(true)` (inserted) means this is
+   the first — and only — redemption, so it proceeds; `Ok(false)` (already present)
+   means the key was already consumed → `BadApiKey`.
+
+`put_if_absent` is **atomic across processes** sharing the store: the sqlite store
+implements it as a single `INSERT … ON CONFLICT(id) DO NOTHING` under WAL, so exactly
+one caller — whatever process or thread — observes `Ok(true)`. Single-use therefore
+**no longer depends on the in-process `enroll_lock`**; the lock remains only as
+belt-and-suspenders for the in-process TOFU-pin check (see Key decisions). Tests:
+`bootstrap_key_is_single_use`, `unknown_or_garbage_bootstrap_key_rejected`,
+`bootstrap_key_single_use_under_concurrency` (8 threads, exactly one success), and
+`bootstrap_key_single_use_across_processes` (two independent `TofuClientAuth`
+instances over separate connections to one shared on-disk WAL store — no shared
+`enroll_lock` — both racing the same key; exactly one succeeds, the other gets
+`BadApiKey`).
 
 ### Replay / freshness
 - **Bounded ±skew window.** `is_fresh` (lines 374–383) admits a request iff its
@@ -129,12 +144,18 @@ cannot collide with `("a","bc")` — test `canonicalize_is_unambiguous`, lines
   confuse, and `key_alg` is recorded at enroll for verification dispatch.
 - **Enforce low-s for P-256** (lines 151–157). Closes ECDSA signature malleability so
   a captured signature cannot be re-encoded into a second valid form.
-- **Hash + single-use + constant-time bootstrap keys** (lines 304–366). A stolen store
-  reveals no usable bootstrap key; timing does not leak the comparison; a key works
-  at most once.
-- **Process `Mutex` for enroll atomicity** (lines 250–255, 440–476). The
-  `PersistenceProvider` contract offers no compare-and-set/transaction, so the lock —
-  not the store — is what makes check-then-consume and TOFU check-then-put atomic.
+- **Hash + single-use + constant-time bootstrap keys.** A stolen store reveals no
+  usable bootstrap key; timing does not leak the comparison; a key works at most once.
+- **Store-level CAS for bootstrap single-use.** The persistence contract now offers
+  `put_if_absent` (an atomic insert-if-absent), so single-use is settled by an atomic
+  consume-marker insert rather than a read-modify-write. This holds **across
+  processes** sharing the store, removing the prior dependence on the process-local
+  `enroll_lock` for single-use correctness.
+- **Process `Mutex` as TOFU-pin belt-and-suspenders only.** `enroll_lock` still
+  serializes the in-process TOFU pin `get`→`put` so two threads here don't both treat
+  the same `client_id` as first contact. It is **not** what makes a bootstrap key
+  single-use anymore — that is the store CAS above. Dropping the lock would weaken only
+  the in-process TOFU-pin race for a brand-new `client_id`, not single-use.
 - **Retention predicate distinct from admission** (lines 400–402 vs 374–383). Using
   the symmetric window for eviction would wrongly drop a future-dated entry on a
   backward clock step and reopen a replay slot; trailing-edge retention prevents that.
@@ -148,14 +169,16 @@ cannot collide with `("a","bc")` — test `canonicalize_is_unambiguous`, lines
   with `n − s` and leave `r` unchanged. Reference implementation: `normalizeLowS` in
   `wyrtloom-dashboard-web/src/crypto/clientKey.ts` (README lines 61–68). ed25519 has
   no such requirement — it is deterministic (README line 58).
-- **Single-instance / single-writer assumption.** The replay-nonce cache
-  (`seen_nonces`, lines 256–260) and the bootstrap single-use lock (`enroll_lock`,
-  lines 250–255) are **process-local**. Horizontal scaling would let two instances
-  each admit the same nonce (cross-instance replay) or each consume the same bootstrap
-  key once (cross-process double-enroll), because the store's read-modify-write is not
-  atomic across processes (acknowledged in the code comment, lines 444–447). Fixing
-  this requires moving that state into the shared store with a compare-and-set — which
-  the persistence contract does not currently offer.
+- **Replay cache is process-local.** The per-request replay/nonce cache
+  (`seen_nonces`) is **process-local**. Horizontal scaling over a shared store would
+  let two instances each admit the same `(client_id, nonce)` once (cross-instance
+  replay) within the ±skew window, because that cache is in-memory per process. Fixing
+  this would require moving nonce state into the shared store with a compare-and-set
+  (the same `put_if_absent` primitive now used for bootstrap single-use). **Bootstrap
+  single-use is no longer subject to this caveat:** it is enforced by the store's
+  atomic `put_if_absent` consume marker, so two instances racing the same bootstrap
+  key still yield exactly one successful enrollment (test
+  `bootstrap_key_single_use_across_processes`).
 - **TOFU first-contact trust.** A MITM on the very first enrollment can pin its own
   key and thereafter authenticate as that client. TOFU trusts whatever key arrives
   first. Mitigations live outside this crate: secure out-of-band bootstrap-key
@@ -173,10 +196,12 @@ cannot collide with `("a","bc")` — test `canonicalize_is_unambiguous`, lines
 - **Distribute bootstrap keys out of band and once.** The plaintext is returned only
   by `issue_bootstrap_key` and never stored recoverably (lines 304–326). Treat it as a
   one-time secret; it is single-use and expires on first successful enrollment.
-- **Run a single writer instance (or add store-level CAS first).** With the current
-  process-local replay cache and enroll lock, deploy as a single instance — or move
-  replay-nonce and bootstrap single-use state into the shared store with compare-and-set
-  before scaling horizontally (see Gotchas).
+- **Replay cache requires a single instance (bootstrap single-use does not).**
+  Bootstrap-key single-use is cross-process atomic (store CAS), so multiple instances
+  may safely share one store for enrollment. The per-request replay/nonce cache,
+  however, is still process-local: run a single instance, or move replay-nonce state
+  into the shared store with `put_if_absent`, before relying on cross-instance replay
+  protection (see Gotchas).
 - **Use TLS for non-loopback enrollment and requests.** This crate authenticates and
   binds requests but provides no transport security; first-contact MITM and request
   confidentiality are the deployment's responsibility.
@@ -186,7 +211,11 @@ cannot collide with `("a","bc")` — test `canonicalize_is_unambiguous`, lines
 - **Size the replay cache for your rate.** Steady-state live entries are
   O(2·skew·rate); the hard cap is 1,000,000 (line 73) and the scheme fails closed at
   the cap. Ensure expected `skew × request-rate` stays well under the cap.
-- **Provide a durable `PersistenceProvider`.** Pinned clients and bootstrap-key
-  consumption state are only as durable as the injected store; losing it loses the
-  TOFU pins and the consumed-key record (collections `clients` and `bootstrap_keys`,
-  lines 60–63, 281–292).
+- **Provide a durable `PersistenceProvider` with an atomic `put_if_absent`.** Pinned
+  clients and bootstrap-key consumption state are only as durable as the injected
+  store; losing it loses the TOFU pins and the consumed-key markers (collections
+  `clients`, `bootstrap_keys`, and `consumed_bootstrap_keys`). Cross-process
+  single-use additionally **requires** the store's `put_if_absent` to be genuinely
+  atomic across connections/processes (the sqlite store's `INSERT … ON CONFLICT DO
+  NOTHING` under WAL is; the contract's default get-then-put fallback is **not** and
+  must not be used as a shared backing store for single-use).

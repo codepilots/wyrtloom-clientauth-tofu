@@ -10,8 +10,10 @@
 //!    and distributes the plaintext out of band. Only its SHA-256 hash is stored.
 //! 2. A client makes first contact via [`enroll`](TofuClientAuth::enroll), presenting the
 //!    bootstrap key and its **ed25519 public key**. The server validates the key
-//!    (hash + constant-time compare against an unconsumed record), marks it consumed,
-//!    and **pins** the public key (TOFU). Only the public key + fingerprint are stored.
+//!    (hash + constant-time compare against the issued record), **atomically consumes
+//!    it** via the store's compare-and-set (single-use even across processes sharing
+//!    the store), and **pins** the public key (TOFU). Only the public key +
+//!    fingerprint are stored.
 //! 3. Each subsequent request is verified by [`verify`](TofuClientAuth::verify): an
 //!    ed25519 signature over the canonical request bytes, a bounded ±skew timestamp
 //!    window, and a per-request nonce checked against a bounded, evicting replay cache.
@@ -21,7 +23,9 @@
 //! - **Asymmetric only.** The store never holds a recoverable secret — only the
 //!   client's public key and its SHA-256 fingerprint.
 //! - **Bootstrap keys** are CSPRNG, ≥128-bit, single-use, stored hashed, and
-//!   constant-time compared. A bad or already-consumed key yields [`ClientAuthError::BadApiKey`].
+//!   constant-time compared. Single-use is enforced by an atomic consume marker
+//!   (`put_if_absent`), so it holds across processes sharing the store — not merely
+//!   within one process. A bad or already-consumed key yields [`ClientAuthError::BadApiKey`].
 //! - **Canonicalization** ([`canonicalize`]) length-prefixes every field under a
 //!   domain-separation tag so field-boundary confusion is impossible and clients and
 //!   the server build identical signed bytes.
@@ -61,6 +65,12 @@ pub const DOMAIN_TAG: &[u8] = wyrtloom_core::client_auth::CLIENT_AUTH_DOMAIN.as_
 const CLIENTS: &str = "clients";
 /// Collection holding hashed, single-use bootstrap keys.
 const BOOTSTRAP_KEYS: &str = "bootstrap_keys";
+/// Collection of consume markers, one per redeemed bootstrap key. The marker's id
+/// is the key's SHA-256 hash; its presence means the key was already consumed.
+/// First-consumption is decided by an atomic `put_if_absent` here (a store-level
+/// compare-and-set), so single-use holds across processes sharing the store — not
+/// merely within one process via a lock.
+const CONSUMED_BOOTSTRAP_KEYS: &str = "consumed_bootstrap_keys";
 
 /// Default permitted clock skew (seconds) for the timestamp / replay window.
 pub const DEFAULT_SKEW_SECS: i64 = 300;
@@ -161,13 +171,26 @@ fn verify_signature(
     }
 }
 
-/// Stored shape of a bootstrap key: only the hash, plus single-use state.
+/// Stored shape of an *issued* bootstrap key: only its hash and issue time. The
+/// "consumed" state is no longer a mutable flag on this record — it is tracked
+/// out-of-band by the presence of a marker in [`CONSUMED_BOOTSTRAP_KEYS`], decided
+/// atomically by the store's compare-and-set. Keeping issuance and consumption in
+/// separate records is what lets a single `put_if_absent` settle single-use without
+/// any read-modify-write here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredBootstrapKey {
     /// SHA-256 hex of the plaintext bootstrap key.
     key_hash: String,
-    consumed: bool,
     issued_at: Timestamp,
+}
+
+/// Stored shape of a consume marker: its id (in [`CONSUMED_BOOTSTRAP_KEYS`]) is the
+/// key's SHA-256 hash, so its mere presence means the key was redeemed. The body is
+/// purely informational (when it was consumed); single-use correctness depends only
+/// on the atomic insert of this row, never on reading it back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConsumedBootstrapKey {
+    consumed_at: Timestamp,
 }
 
 /// Bounded, evicting replay cache with O(1) membership.
@@ -247,11 +270,16 @@ impl ReplayCache {
 /// Trust-on-first-use client-authentication scheme over an injected store.
 pub struct TofuClientAuth {
     store: Arc<dyn PersistenceProvider>,
-    /// Serializes the read-modify-write of `enroll` (TOFU check-then-put and the
-    /// single-use bootstrap-key get-then-consume). The `PersistenceProvider`
-    /// contract offers no compare-and-set/transaction, so this lock — not the
-    /// store — is what makes those sequences atomic and keeps a bootstrap key
-    /// truly single-use under concurrent enrollment.
+    /// Belt-and-suspenders serialization of the in-process TOFU pin check
+    /// (`get` → `put` on [`CLIENTS`]) so two threads in THIS process don't
+    /// interleave a first-contact insert. It is **not** what makes a bootstrap key
+    /// single-use: that guarantee now rests entirely on the store's atomic
+    /// `put_if_absent` consume marker (see [`consume_bootstrap_key`]), which holds
+    /// across processes sharing the store. Single-use correctness does not depend on
+    /// this lock; dropping it would only weaken the cross-process-shared TOFU-pin
+    /// race for a never-before-seen client_id, not single-use.
+    ///
+    /// [`consume_bootstrap_key`]: TofuClientAuth::consume_bootstrap_key
     enroll_lock: Mutex<()>,
     /// Bounded, O(1)-membership cache of recently seen `(client_id, nonce)`. On each
     /// `verify` an entry is evicted exactly when a replay of it could no longer be
@@ -290,6 +318,14 @@ impl TofuClientAuth {
                 indexed_fields: vec!["key_hash".into()],
             })
             .map_err(store_err)?;
+        // Consume markers are looked up only by their id (the key hash) via the
+        // atomic `put_if_absent`, so the record body needs no secondary index.
+        store
+            .ensure_collection(&CollectionSpec {
+                name: CONSUMED_BOOTSTRAP_KEYS.into(),
+                indexed_fields: vec![],
+            })
+            .map_err(store_err)?;
         Ok(Self {
             store,
             enroll_lock: Mutex::new(()),
@@ -299,8 +335,12 @@ impl TofuClientAuth {
     }
 
     /// Mint a single-use bootstrap key. A CSPRNG ≥128-bit token is generated; only
-    /// its SHA-256 hash is persisted (`consumed: false`). The plaintext is returned
-    /// **once** for the operator to distribute out of band — it is not recoverable.
+    /// its SHA-256 hash is persisted (an issuance record in [`BOOTSTRAP_KEYS`] — the
+    /// "consumed" state lives separately, see [`consume_bootstrap_key`]). The
+    /// plaintext is returned **once** for the operator to distribute out of band — it
+    /// is not recoverable.
+    ///
+    /// [`consume_bootstrap_key`]: TofuClientAuth::consume_bootstrap_key
     pub fn issue_bootstrap_key(&self) -> Result<String, ClientAuthError> {
         // 256 bits of CSPRNG entropy, well above the 128-bit floor.
         let mut raw = [0u8; 32];
@@ -310,7 +350,6 @@ impl TofuClientAuth {
 
         let record = StoredBootstrapKey {
             key_hash: key_hash.clone(),
-            consumed: false,
             issued_at: Timestamp::now(),
         };
         self.store
@@ -325,11 +364,22 @@ impl TofuClientAuth {
         Ok(plaintext)
     }
 
-    /// Validate a presented bootstrap key and atomically consume it. Returns the
-    /// store id of the consumed record. A bad or already-consumed key → `BadApiKey`.
+    /// Validate a presented bootstrap key and atomically consume it. A bad,
+    /// never-issued, or already-consumed key → `BadApiKey`.
+    ///
+    /// Single-use is settled by a store-level **compare-and-set**, not by any
+    /// read-modify-write here: after confirming the key was genuinely issued (its
+    /// hash exists in [`BOOTSTRAP_KEYS`], constant-time compared), we attempt to
+    /// insert a consume marker keyed by that hash via [`PersistenceProvider::put_if_absent`].
+    /// That insert is atomic across processes sharing the store (the sqlite store
+    /// uses a single `INSERT … ON CONFLICT DO NOTHING` under WAL), so exactly one
+    /// caller — process or thread — observes `Ok(true)` and consumes the key; every
+    /// other concurrent or later attempt observes `Ok(false)` and is rejected. The
+    /// in-process `enroll_lock` is NOT relied upon for this guarantee.
     fn consume_bootstrap_key(&self, presented: &str) -> Result<(), ClientAuthError> {
         let hash = sha256_hex(presented.as_bytes());
-        // Look up by the hash id directly (it *is* the record id).
+        // 1. Confirm the key was actually issued. Look up by the hash id directly
+        //    (it *is* the record id).
         let record = match self.store.get(BOOTSTRAP_KEYS, &hash) {
             Ok(r) => r,
             Err(StoreError::NotFound(_)) => return Err(ClientAuthError::BadApiKey),
@@ -340,28 +390,31 @@ impl TofuClientAuth {
         // Constant-time compare the stored hash against the recomputed hash. (The
         // id lookup already matched, but compare explicitly so the verification
         // path is uniform and resistant to any future change in lookup strategy.)
-        let matches: bool = stored
-            .key_hash
-            .as_bytes()
-            .ct_eq(hash.as_bytes())
-            .into();
-        if !matches || stored.consumed {
+        let matches: bool = stored.key_hash.as_bytes().ct_eq(hash.as_bytes()).into();
+        if !matches {
             return Err(ClientAuthError::BadApiKey);
         }
 
-        let consumed = StoredBootstrapKey {
-            consumed: true,
-            ..stored
+        // 2. Atomically claim single-use. The FIRST insert of this marker wins
+        //    (Ok(true)); any subsequent attempt — even from another process —
+        //    sees the marker already present (Ok(false)) and is rejected. This is
+        //    the sole arbiter of single-use; it does not depend on `enroll_lock`.
+        let marker = ConsumedBootstrapKey {
+            consumed_at: Timestamp::now(),
         };
-        self.store
-            .put(
-                BOOTSTRAP_KEYS,
+        let inserted = self
+            .store
+            .put_if_absent(
+                CONSUMED_BOOTSTRAP_KEYS,
                 Record {
                     id: hash,
-                    doc: to_value(&consumed)?,
+                    doc: to_value(&marker)?,
                 },
             )
             .map_err(store_err)?;
+        if !inserted {
+            return Err(ClientAuthError::BadApiKey);
+        }
         Ok(())
     }
 
@@ -437,14 +490,15 @@ impl ClientAuthScheme for TofuClientAuth {
         let client_id = fingerprint.clone();
         let public_key_hex = hex_encode(&req.public_key);
 
-        // Serialize the rest of enroll: the TOFU check-then-put and the
-        // single-use bootstrap-key get-then-consume are read-modify-write
-        // sequences that the store cannot make atomic on its own. Holding this
-        // lock for the remainder makes them atomic within the process, so a
-        // bootstrap key cannot be consumed twice by concurrent enrollments.
-        // (A disk-backed store shared across *processes* would still need a
-        // store-level transaction; that is a limitation of the persistence
-        // contract, not of this lock.)
+        // Serialize the in-process TOFU pin check (`get` → `put` on CLIENTS) so two
+        // threads here don't both treat the same client_id as first contact. This is
+        // belt-and-suspenders only: single-use of the bootstrap key is enforced by
+        // the store's atomic `put_if_absent` consume marker in
+        // `consume_bootstrap_key`, which holds even across separate processes sharing
+        // the store and does NOT rely on this lock. (For a store shared across
+        // processes, the TOFU-pin first-contact race is settled by the consume marker
+        // being burned exactly once, so at most one process completes a first-contact
+        // enrollment for a given bootstrap key.)
         let _enroll_guard = self
             .enroll_lock
             .lock()
@@ -1182,6 +1236,78 @@ mod tests {
             }
         }
         assert_eq!(successes, 1, "single-use bootstrap key authorized {successes} enrollments");
+    }
+
+    #[test]
+    fn bootstrap_key_single_use_across_processes() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        // Simulate two separate PROCESSES sharing one on-disk WAL store: each opens
+        // its OWN SqliteStore connection to the SAME file and wraps it in its OWN
+        // TofuClientAuth (so there is NO shared `enroll_lock` — the only thing that
+        // could serialize them is the store's atomic `put_if_absent`). Both try to
+        // enroll DIFFERENT clients with the SAME bootstrap key concurrently; exactly
+        // one must succeed and the other must get BadApiKey. This proves single-use
+        // no longer depends on the in-process lock.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "wyrtloom_tofu_xproc_{}_{:?}.db",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let path_str = path.to_str().unwrap().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        // Issue the key via a first connection, then drop it so the two racing
+        // instances are wholly independent.
+        let key = {
+            let store: Arc<dyn PersistenceProvider> =
+                Arc::new(SqliteStore::open(&path_str).unwrap());
+            let issuer = TofuClientAuth::new(store).unwrap();
+            issuer.issue_bootstrap_key().unwrap()
+        };
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let key = key.clone();
+                let path_str = path_str.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    // A wholly separate store connection + scheme instance ⇒ a
+                    // separate `enroll_lock`. The shared on-disk file is the only
+                    // common state.
+                    let store: Arc<dyn PersistenceProvider> =
+                        Arc::new(SqliteStore::open(&path_str).unwrap());
+                    let scheme = TofuClientAuth::new(store).unwrap();
+                    let sk = SigningKey::generate(&mut OsRng);
+                    barrier.wait(); // maximise contention
+                    scheme.enroll(EnrollmentRequest {
+                        api_key: key,
+                        client_name: "xproc".into(),
+                        public_key: sk.verifying_key().to_bytes().to_vec(),
+                    })
+                })
+            })
+            .collect();
+
+        let mut successes = 0;
+        for h in handles {
+            match h.join().unwrap() {
+                Ok(_) => successes += 1,
+                Err(ClientAuthError::BadApiKey) => {}
+                Err(other) => panic!("unexpected enroll error: {other:?}"),
+            }
+        }
+        assert_eq!(
+            successes, 1,
+            "cross-process single-use: {successes} enrollments authorized by one key"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{path_str}-shm"));
     }
 
     #[test]
