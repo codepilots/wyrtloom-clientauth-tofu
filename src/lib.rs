@@ -36,6 +36,7 @@
 //!   saturating arithmetic, so out-of-range values are rejected without panicking
 //!   or wrapping into the window.
 
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -63,6 +64,13 @@ const BOOTSTRAP_KEYS: &str = "bootstrap_keys";
 
 /// Default permitted clock skew (seconds) for the timestamp / replay window.
 pub const DEFAULT_SKEW_SECS: i64 = 300;
+
+/// Hard cap on live nonce-cache entries. Under `now` monotonic in practice, live
+/// timestamps span at most `2·skew`, so the steady-state size is O(2·skew·rate);
+/// this cap is a fail-closed backstop against an unbounded burst (e.g. a forged
+/// clock feeding many distinct in-window nonces). When the cap is hit, `verify`
+/// rejects (fail closed) rather than admitting an unbounded request.
+const MAX_NONCE_ENTRIES: usize = 1_000_000;
 
 /// Maximum accepted `client_name` length (chars).
 const MAX_CLIENT_NAME_LEN: usize = 256;
@@ -140,6 +148,13 @@ fn verify_signature(
             let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(&pk_bytes).map_err(|_| corrupt())?;
             let signature =
                 p256::ecdsa::Signature::from_slice(sig).map_err(|_| ClientAuthError::BadSignature)?;
+            // Enforce low-s (canonical) signatures to remove ECDSA malleability:
+            // a high-s signature can be flipped to a second, distinct, still-valid
+            // encoding of the same message. `normalize_s()` returns `Some(_)` only
+            // when the input was non-canonical (high-s), so reject those outright.
+            if signature.normalize_s().is_some() {
+                return Err(ClientAuthError::BadSignature);
+            }
             vk.verify(msg, &signature).map_err(|_| ClientAuthError::BadSignature)
         }
         _ => Err(ClientAuthError::Storage("unknown key algorithm".into())),
@@ -155,12 +170,78 @@ struct StoredBootstrapKey {
     issued_at: Timestamp,
 }
 
-/// A recorded nonce sighting within the replay window.
-#[derive(Debug, Clone)]
-struct NonceEntry {
-    client_id: String,
-    nonce: String,
-    timestamp: i64,
+/// Bounded, evicting replay cache with O(1) membership.
+///
+/// Membership is a [`HashSet`] of `(client_id, nonce)` keys so the replay check is
+/// O(1) instead of an O(n) linear scan under the mutex. Eviction is tracked by a
+/// [`VecDeque`] of `(timestamp, key)` recording each admitted entry.
+///
+/// On each call, eviction matches the prior code's `retain` semantics exactly: it
+/// drops **every** entry that is no longer [`is_replayable`] at `now`, regardless of
+/// its position in the queue. A front-only pop would be unsound for the memory
+/// bound here because the queue is *not* timestamp-ordered — `presented.timestamp`
+/// is client-controlled across the whole `[now-skew, now+skew]` admission band, so a
+/// future-dated entry can sit ahead of already-expired ones and would block a
+/// front-only sweep, letting non-replayable stragglers accumulate toward the cap. A
+/// full retain keeps the live set bounded at O(2·skew·rate) under adversarial
+/// timestamps and never evicts a still-replayable entry (no trailing-edge replay
+/// slot), preserving the documented retention contract.
+struct ReplayCache {
+    /// O(1) membership over `(client_id, nonce)`.
+    seen: HashSet<(String, String)>,
+    /// Eviction queue mirroring `seen`'s membership, in admission order.
+    order: VecDeque<(i64, (String, String))>,
+    /// Fail-closed cap on live entries.
+    max_entries: usize,
+}
+
+impl ReplayCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            seen: HashSet::new(),
+            order: VecDeque::new(),
+            max_entries,
+        }
+    }
+
+    /// Evict every entry whose timestamp is no longer replayable at `now`, then test
+    /// the presented `(client_id, nonce)` for replay and, if fresh, record it.
+    ///
+    /// Returns `Ok(true)` if the nonce was newly recorded, `Ok(false)` if it is a
+    /// replay, and `Err(())` if recording would exceed `max_entries`
+    /// (fail closed). Eviction uses the same `now`/`skew` as admission via
+    /// [`is_replayable`], so an admitted nonce is retained for exactly as long as a
+    /// replay of it would still pass admission — no trailing-edge slot.
+    fn check_and_record(
+        &mut self,
+        client_id: &str,
+        nonce: &str,
+        timestamp: i64,
+        now: i64,
+        skew: i64,
+    ) -> Result<bool, ()> {
+        // Drop every no-longer-replayable entry (full sweep, position-independent),
+        // mirroring the prior `Vec::retain`. The membership set stays in sync.
+        let seen = &mut self.seen;
+        self.order.retain(|(ts, key)| {
+            let keep = is_replayable(now, *ts, skew);
+            if !keep {
+                seen.remove(key);
+            }
+            keep
+        });
+
+        let key = (client_id.to_string(), nonce.to_string());
+        if self.seen.contains(&key) {
+            return Ok(false);
+        }
+        if self.seen.len() >= self.max_entries {
+            return Err(());
+        }
+        self.seen.insert(key.clone());
+        self.order.push_back((timestamp, key));
+        Ok(true)
+    }
 }
 
 /// Trust-on-first-use client-authentication scheme over an injected store.
@@ -172,11 +253,11 @@ pub struct TofuClientAuth {
     /// store — is what makes those sequences atomic and keeps a bootstrap key
     /// truly single-use under concurrent enrollment.
     enroll_lock: Mutex<()>,
-    /// Bounded cache of recently seen `(client_id, nonce, timestamp)`. On each
+    /// Bounded, O(1)-membership cache of recently seen `(client_id, nonce)`. On each
     /// `verify` an entry is evicted exactly when a replay of it could no longer be
-    /// admitted (see `is_replayable` and `verify_at`), so no in-window nonce is
+    /// admitted (see `is_replayable` and `ReplayCache`), so no in-window nonce is
     /// ever evicted while it remains replayable.
-    seen_nonces: Mutex<Vec<NonceEntry>>,
+    seen_nonces: Mutex<ReplayCache>,
     skew_secs: i64,
 }
 
@@ -212,7 +293,7 @@ impl TofuClientAuth {
         Ok(Self {
             store,
             enroll_lock: Mutex::new(()),
-            seen_nonces: Mutex::new(Vec::new()),
+            seen_nonces: Mutex::new(ReplayCache::new(MAX_NONCE_ENTRIES)),
             skew_secs,
         })
     }
@@ -470,18 +551,18 @@ impl TofuClientAuth {
             .seen_nonces
             .lock()
             .map_err(|_| ClientAuthError::Storage("nonce cache poisoned".into()))?;
-        cache.retain(|e| is_replayable(now, e.timestamp, self.skew_secs));
-        if cache
-            .iter()
-            .any(|e| e.client_id == presented.client_id && e.nonce == presented.nonce)
-        {
-            return Err(ClientAuthError::Replay);
+        match cache.check_and_record(
+            &presented.client_id,
+            &presented.nonce,
+            presented.timestamp,
+            now,
+            self.skew_secs,
+        ) {
+            Ok(true) => { /* fresh nonce, recorded */ }
+            Ok(false) => return Err(ClientAuthError::Replay),
+            // Cap exceeded: fail closed rather than admit an unbounded request.
+            Err(()) => return Err(ClientAuthError::Storage("nonce cache full".into())),
         }
-        cache.push(NonceEntry {
-            client_id: presented.client_id.clone(),
-            nonce: presented.nonce.clone(),
-            timestamp: presented.timestamp,
-        });
         drop(cache);
 
         Ok(ClientIdentity {
@@ -636,9 +717,14 @@ mod tests {
             .expect("p256 enroll");
 
         // Sign the canonical request (raw r‖s, as WebCrypto sign('ECDSA') emits).
+        // The verifier requires canonical low-s form to remove malleability, so a
+        // compliant client normalizes s before sending (the RustCrypto `p256` signer
+        // does not auto-normalize; `normalize_s()` yields the canonical twin when the
+        // freshly-signed value happened to be high-s).
         let canonical =
             canonicalize("POST", "/api/login", &sha256_bytes(b"{}"), &cred.client_id, 1_000, "n1");
-        let sig: P256Sig = sk.sign(&canonical);
+        let raw: P256Sig = sk.sign(&canonical);
+        let sig = raw.normalize_s().unwrap_or(raw);
         let presented = PresentedClientAuth {
             client_id: cred.client_id.clone(),
             canonical_request: canonical,
@@ -653,6 +739,65 @@ mod tests {
         bad.signature[10] ^= 0x01;
         bad.nonce = "n2".into();
         assert!(matches!(s.verify_at(&bad, 1_000), Err(ClientAuthError::BadSignature)));
+    }
+
+    #[test]
+    fn p256_high_s_signature_rejected() {
+        // ECDSA signatures are malleable: (r, s) and (r, n - s) both verify. We
+        // enforce low-s (canonical) form, so a high-s variant of a valid signature
+        // must be rejected even though it is cryptographically valid for the message.
+        use p256::ecdsa::{signature::Signer, Signature as P256Sig, SigningKey as P256Key};
+        let s = scheme();
+        let key = s.issue_bootstrap_key().unwrap();
+
+        let sk = P256Key::random(&mut OsRng);
+        let pubkey = sk.verifying_key().to_encoded_point(false).as_bytes().to_vec();
+        let cred = s
+            .enroll(EnrollmentRequest {
+                api_key: key,
+                client_name: "web-spa".into(),
+                public_key: pubkey,
+            })
+            .expect("p256 enroll");
+
+        let canonical =
+            canonicalize("POST", "/api/login", &sha256_bytes(b"{}"), &cred.client_id, 1_000, "hs1");
+        // The RustCrypto signer does not auto-normalize, so explicitly canonicalize
+        // to low-s to obtain the form a compliant client would send.
+        let raw: P256Sig = sk.sign(&canonical);
+        let sig = raw.normalize_s().unwrap_or(raw);
+        assert!(sig.normalize_s().is_none(), "base sig must be canonical low-s");
+
+        // The canonical low-s signature verifies.
+        let low = PresentedClientAuth {
+            client_id: cred.client_id.clone(),
+            canonical_request: canonical.clone(),
+            signature: sig.to_bytes().to_vec(),
+            timestamp: 1_000,
+            nonce: "hs1".into(),
+        };
+        assert!(s.verify_at(&low, 1_000).is_ok(), "low-s signature must verify");
+
+        // Construct the high-s malleated twin: s' = n - s. Negating the (low-s)
+        // scalar yields its non-canonical high-s equivalent, an equally valid
+        // ECDSA signature for the same message.
+        let (r, s_scalar) = (sig.r(), sig.s());
+        let high_s = -*s_scalar; // n - s, the non-canonical twin
+        let high_sig = P256Sig::from_scalars(r, high_s).expect("high-s sig");
+        // Sanity: the constructed sig is genuinely high-s (normalize would change it).
+        assert!(high_sig.normalize_s().is_some(), "constructed sig must be high-s");
+
+        let high = PresentedClientAuth {
+            client_id: cred.client_id.clone(),
+            canonical_request: canonical,
+            signature: high_sig.to_bytes().to_vec(),
+            timestamp: 1_000,
+            nonce: "hs2".into(),
+        };
+        assert!(
+            matches!(s.verify_at(&high, 1_000), Err(ClientAuthError::BadSignature)),
+            "high-s (malleated) signature must be rejected"
+        );
     }
 
     #[test]
@@ -848,6 +993,44 @@ mod tests {
         // but such an entry can never have been admitted (is_fresh rejects it), so it
         // never enters the cache; harmless.
         assert!(is_replayable(0, i64::MAX, skew));
+    }
+
+    #[test]
+    fn nonce_cache_caps_and_fails_closed() {
+        // The replay cache must reject (fail closed) once the entry cap is exceeded,
+        // rather than growing unbounded. Drive the ReplayCache directly with a small
+        // injected cap so the test stays fast (the production cap is MAX_NONCE_ENTRIES).
+        let skew = 300;
+        let cap = 4;
+        let mut cache = ReplayCache::new(cap);
+        let now = 1_000_000_000;
+        for i in 0..cap {
+            let nonce = format!("n{i}");
+            assert_eq!(
+                cache.check_and_record("client", &nonce, now, now, skew),
+                Ok(true),
+                "fresh nonce {i} must be recorded"
+            );
+        }
+        // Cap reached: a further distinct, in-window nonce fails closed.
+        assert_eq!(
+            cache.check_and_record("client", "overflow", now, now, skew),
+            Err(()),
+            "exceeding the cap must fail closed"
+        );
+        // A replay of an already-seen nonce is still detected (membership intact).
+        assert_eq!(
+            cache.check_and_record("client", "n0", now, now, skew),
+            Ok(false),
+            "replay must still be detected at the cap"
+        );
+        // Advancing `now` past the window evicts the lot, freeing capacity again.
+        let later = now + skew + 1;
+        assert_eq!(
+            cache.check_and_record("client", "after-evict", later, later, skew),
+            Ok(true),
+            "eviction must free capacity once entries fall out of the window"
+        );
     }
 
     #[test]
