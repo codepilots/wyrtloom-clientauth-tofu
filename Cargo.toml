@@ -8,6 +8,9 @@ license = "Apache-2.0"
 wyrtloom-core = { path = "../wyrtloom/crates/core" }
 # git fallback (commented): wyrtloom-core = { git = "https://github.com/codepilots/wyrtloom.git", rev = "<sha>" }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+# ECDSA P-256 for browser WebCrypto clients (non-extractable keys; universally
+# supported by SubtleCrypto). ed25519 remains for native/CLI clients.
+p256 = { version = "0.13", features = ["ecdsa"] }
 sha2 = "0.10"
 rand = "0.8"
 subtle = "2"          # constant-time comparison

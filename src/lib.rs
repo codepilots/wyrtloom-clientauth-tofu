@@ -72,12 +72,78 @@ const MAX_CLIENT_NAME_LEN: usize = 256;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredClient {
     client_id: String,
-    /// ed25519 public key, hex-encoded.
+    /// Public key, hex-encoded. ed25519 raw (32 bytes) or SEC1 uncompressed
+    /// P-256 (65 bytes), per `key_alg`.
     public_key: String,
+    /// Signature algorithm: `"ed25519"` or `"p256"`. Defaulted for records
+    /// written before P-256 support (all such records are ed25519).
+    #[serde(default = "default_key_alg")]
+    key_alg: String,
     /// SHA-256 hex of the raw public-key bytes (the TOFU pin / fingerprint).
     fingerprint: String,
     client_name: String,
     enrolled_at: Timestamp,
+}
+
+fn default_key_alg() -> String {
+    "ed25519".to_string()
+}
+
+/// Detect and validate the public-key algorithm from its encoding: a 32-byte
+/// ed25519 key, or a 65-byte SEC1 *uncompressed* P-256 key (`0x04` prefix). The
+/// two encodings are unambiguous by length, so no separate algorithm field is
+/// needed on the wire — the scheme decides how to interpret the contract's
+/// opaque `public_key` bytes.
+fn detect_key_alg(public_key: &[u8]) -> Result<&'static str, ClientAuthError> {
+    match public_key.len() {
+        32 => {
+            let b: [u8; 32] = public_key.try_into().unwrap();
+            VerifyingKey::from_bytes(&b)
+                .map_err(|_| ClientAuthError::Invalid("invalid ed25519 public_key".into()))?;
+            Ok("ed25519")
+        }
+        65 if public_key[0] == 0x04 => {
+            p256::ecdsa::VerifyingKey::from_sec1_bytes(public_key)
+                .map_err(|_| ClientAuthError::Invalid("invalid P-256 public_key".into()))?;
+            Ok("p256")
+        }
+        _ => Err(ClientAuthError::Invalid(
+            "public_key must be a 32-byte ed25519 key or a 65-byte SEC1 P-256 key".into(),
+        )),
+    }
+}
+
+/// Verify a signature over `msg` for the stored hex public key, dispatching on
+/// the recorded algorithm. WebCrypto emits raw r‖s (P1363) ECDSA signatures and
+/// SEC1 public keys, matching the `p256` crate's `from_slice`/`from_sec1_bytes`.
+fn verify_signature(
+    key_alg: &str,
+    public_key_hex: &str,
+    msg: &[u8],
+    sig: &[u8],
+) -> Result<(), ClientAuthError> {
+    let corrupt = || ClientAuthError::Storage("stored public key is corrupt".into());
+    match key_alg {
+        "ed25519" => {
+            let vk_bytes = hex_decode(public_key_hex)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                .ok_or_else(corrupt)?;
+            let vk = VerifyingKey::from_bytes(&vk_bytes).map_err(|_| corrupt())?;
+            let sig_bytes: [u8; 64] = sig.try_into().map_err(|_| ClientAuthError::BadSignature)?;
+            vk.verify(msg, &Signature::from_bytes(&sig_bytes))
+                .map_err(|_| ClientAuthError::BadSignature)
+        }
+        "p256" => {
+            use p256::ecdsa::signature::Verifier as _;
+            let pk_bytes = hex_decode(public_key_hex).map_err(|_| corrupt())?;
+            let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(&pk_bytes).map_err(|_| corrupt())?;
+            let signature =
+                p256::ecdsa::Signature::from_slice(sig).map_err(|_| ClientAuthError::BadSignature)?;
+            vk.verify(msg, &signature).map_err(|_| ClientAuthError::BadSignature)
+        }
+        _ => Err(ClientAuthError::Storage("unknown key algorithm".into())),
+    }
 }
 
 /// Stored shape of a bootstrap key: only the hash, plus single-use state.
@@ -281,15 +347,9 @@ impl ClientAuthScheme for TofuClientAuth {
             ));
         }
 
-        // 2. Validate the presented public key is a real ed25519 key before we burn
-        //    the single-use bootstrap key, so a malformed key doesn't waste the token.
-        let vk_bytes: [u8; 32] = req
-            .public_key
-            .as_slice()
-            .try_into()
-            .map_err(|_| ClientAuthError::Invalid("public_key must be 32 bytes".into()))?;
-        VerifyingKey::from_bytes(&vk_bytes)
-            .map_err(|_| ClientAuthError::Invalid("public_key is not a valid ed25519 key".into()))?;
+        // 2. Detect + validate the public key (ed25519 or P-256) before we burn the
+        //    single-use bootstrap key, so a malformed key doesn't waste the token.
+        let key_alg = detect_key_alg(&req.public_key)?;
 
         // 3. Derive the deterministic fingerprint and client_id from the public key.
         let fingerprint = sha256_hex(&req.public_key);
@@ -339,6 +399,7 @@ impl ClientAuthScheme for TofuClientAuth {
         let stored = StoredClient {
             client_id: client_id.clone(),
             public_key: public_key_hex,
+            key_alg: key_alg.to_string(),
             fingerprint: fingerprint.clone(),
             client_name: name.to_string(),
             enrolled_at: enrolled_at.clone(),
@@ -384,23 +445,14 @@ impl TofuClientAuth {
         };
         let stored: StoredClient = from_value(record.doc)?;
 
-        // 2. Verify the ed25519 signature over the presented canonical request.
-        let vk_bytes = hex_decode(&stored.public_key)
-            .ok()
-            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
-            .ok_or_else(|| ClientAuthError::Storage("stored public key is corrupt".into()))?;
-        let verifying_key = VerifyingKey::from_bytes(&vk_bytes)
-            .map_err(|_| ClientAuthError::Storage("stored public key is corrupt".into()))?;
-
-        let sig_bytes: [u8; 64] = presented
-            .signature
-            .as_slice()
-            .try_into()
-            .map_err(|_| ClientAuthError::BadSignature)?;
-        let signature = Signature::from_bytes(&sig_bytes);
-        verifying_key
-            .verify(&presented.canonical_request, &signature)
-            .map_err(|_| ClientAuthError::BadSignature)?;
+        // 2. Verify the signature (ed25519 or P-256) over the presented canonical
+        //    request, using the stored key's recorded algorithm.
+        verify_signature(
+            &stored.key_alg,
+            &stored.public_key,
+            &presented.canonical_request,
+            &presented.signature,
+        )?;
 
         // 3. Enforce the bounded ±skew timestamp window. A request is admitted
         //    iff its timestamp is fresh relative to `now`.
@@ -561,6 +613,46 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, ClientAuthError::BadApiKey), "got {err:?}");
+    }
+
+    #[test]
+    fn p256_webcrypto_client_enrolls_and_verifies() {
+        use p256::ecdsa::{signature::Signer, Signature as P256Sig, SigningKey as P256Key};
+        let s = scheme();
+        let key = s.issue_bootstrap_key().unwrap();
+
+        // A browser generates a non-extractable P-256 key and enrolls its SEC1
+        // uncompressed public key (0x04 || X || Y, 65 bytes) — exactly what
+        // SubtleCrypto exportKey('raw') produces.
+        let sk = P256Key::random(&mut OsRng);
+        let pubkey = sk.verifying_key().to_encoded_point(false).as_bytes().to_vec();
+        assert_eq!(pubkey.len(), 65);
+        let cred = s
+            .enroll(EnrollmentRequest {
+                api_key: key,
+                client_name: "web-spa".into(),
+                public_key: pubkey,
+            })
+            .expect("p256 enroll");
+
+        // Sign the canonical request (raw r‖s, as WebCrypto sign('ECDSA') emits).
+        let canonical =
+            canonicalize("POST", "/api/login", &sha256_bytes(b"{}"), &cred.client_id, 1_000, "n1");
+        let sig: P256Sig = sk.sign(&canonical);
+        let presented = PresentedClientAuth {
+            client_id: cred.client_id.clone(),
+            canonical_request: canonical,
+            signature: sig.to_bytes().to_vec(),
+            timestamp: 1_000,
+            nonce: "n1".into(),
+        };
+        assert!(s.verify_at(&presented, 1_000).is_ok(), "valid P-256 signature must verify");
+
+        // Tampered signature is rejected (fresh nonce to bypass the replay cache).
+        let mut bad = presented.clone();
+        bad.signature[10] ^= 0x01;
+        bad.nonce = "n2".into();
+        assert!(matches!(s.verify_at(&bad, 1_000), Err(ClientAuthError::BadSignature)));
     }
 
     #[test]
@@ -798,6 +890,7 @@ mod tests {
         let forged = StoredClient {
             client_id: client_id.clone(),
             public_key: hex_encode(&sk_other.verifying_key().to_bytes()),
+            key_alg: "ed25519".into(),
             fingerprint: fingerprint.clone(),
             client_name: "pinned".into(),
             enrolled_at: Timestamp::now(),
@@ -848,6 +941,7 @@ mod tests {
                 "client_name",
                 "enrolled_at",
                 "fingerprint",
+                "key_alg",
                 "public_key"
             ]
         );
