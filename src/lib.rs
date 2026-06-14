@@ -25,8 +25,16 @@
 //! - **Canonicalization** ([`canonicalize`]) length-prefixes every field under a
 //!   domain-separation tag so field-boundary confusion is impossible and clients and
 //!   the server build identical signed bytes.
-//! - **Replay protection** enforces a bounded ±skew window and evicts stale nonce
-//!   entries on each `verify`, keeping the cache O(window·rate).
+//! - **Replay protection** enforces a bounded ±skew admission window
+//!   (`[now-skew, now+skew]`) and evicts a nonce on each `verify` the instant a
+//!   replay of it could no longer be admitted. Admission and nonce-retention are
+//!   derived from the *same* `now` and `skew`, so an admitted nonce is retained for
+//!   exactly as long as a replay of it would still pass admission — never evicted
+//!   early (no trailing-edge replay slot) and never retained past usefulness. With
+//!   `now` monotonic in practice, live entries' timestamps span at most `2·skew`,
+//!   bounding the cache at O(2·skew·rate). Attacker-controlled timestamps use
+//!   saturating arithmetic, so out-of-range values are rejected without panicking
+//!   or wrapping into the window.
 
 use std::sync::{Arc, Mutex};
 
@@ -98,8 +106,10 @@ pub struct TofuClientAuth {
     /// store — is what makes those sequences atomic and keeps a bootstrap key
     /// truly single-use under concurrent enrollment.
     enroll_lock: Mutex<()>,
-    /// Bounded cache of recently seen `(client_id, nonce, timestamp)`; entries
-    /// older than `now - skew_secs` are evicted on each `verify`.
+    /// Bounded cache of recently seen `(client_id, nonce, timestamp)`. On each
+    /// `verify` an entry is evicted exactly when a replay of it could no longer be
+    /// admitted (see `is_replayable` and `verify_at`), so no in-window nonce is
+    /// ever evicted while it remains replayable.
     seen_nonces: Mutex<Vec<NonceEntry>>,
     skew_secs: i64,
 }
@@ -212,6 +222,36 @@ impl TofuClientAuth {
     fn now_unix() -> i64 {
         Timestamp::now().0.timestamp()
     }
+}
+
+/// Whether a request stamped `ts` is *fresh* for **admission** relative to `now`
+/// under `skew`: the accepted window is the closed interval `[now-skew, now+skew]`,
+/// rejecting both stale and far-future timestamps.
+///
+/// `ts` is attacker-controlled, so the subtraction is saturating: an out-of-range
+/// timestamp (e.g. `i64::MIN`) saturates to a value far outside `±skew` and is
+/// rejected, never panicking (`i64::MIN.abs()` would) or wrapping into the window.
+fn is_fresh(now: i64, ts: i64, skew: i64) -> bool {
+    now.saturating_sub(ts).saturating_abs() <= skew
+}
+
+/// Whether a nonce recorded with timestamp `ts` could **still be replayed** at
+/// `now` — i.e. a replay carrying that original `ts` would still pass [`is_fresh`]
+/// admission. This is the nonce-cache *retention* predicate.
+///
+/// A replay only ever falls off the **trailing** (past) edge of the admission
+/// window as `now` advances: it stops being admissible exactly when `now - ts >
+/// skew`. The leading (future) edge only gates *first* admission; once an entry is
+/// recorded, `now` only moves toward the trailing edge, so retention must test the
+/// trailing edge alone. Using the symmetric [`is_fresh`] here would wrongly evict a
+/// future-dated-but-still-replayable entry if `now` ever stepped backward (clock
+/// correction), reopening a replay slot. Retaining iff `now - ts <= skew`
+/// guarantees no entry is evicted while a replay of it would still be admitted, and
+/// (under `now` monotonic in practice) bounds the cache at O(2·skew·rate): the
+/// widest a retained entry's `ts` can trail `now` is `skew`, and the furthest ahead
+/// it can have been admitted is `skew`, so live timestamps span `2·skew`.
+fn is_replayable(now: i64, ts: i64, skew: i64) -> bool {
+    now.saturating_sub(ts) <= skew
 }
 
 /// Build the canonical, signed request bytes. **Every field is length-prefixed**
@@ -335,6 +375,21 @@ impl ClientAuthScheme for TofuClientAuth {
     }
 
     fn verify(&self, presented: &PresentedClientAuth) -> Result<ClientIdentity, ClientAuthError> {
+        self.verify_at(presented, Self::now_unix())
+    }
+}
+
+impl TofuClientAuth {
+    /// [`verify`](ClientAuthScheme::verify) with an explicitly supplied notion of
+    /// "now" (Unix seconds). The public trait method calls this with the system
+    /// clock; tests inject `now` to exercise the freshness/eviction boundary
+    /// without sleeping. The freshness check and the cache-eviction predicate are
+    /// both [`is_fresh`] against the *same* `now`, so they can never disagree.
+    fn verify_at(
+        &self,
+        presented: &PresentedClientAuth,
+        now: i64,
+    ) -> Result<ClientIdentity, ClientAuthError> {
         // 1. Look up the pinned client.
         let record = match self.store.get(CLIENTS, &presented.client_id) {
             Ok(r) => r,
@@ -361,20 +416,23 @@ impl ClientAuthScheme for TofuClientAuth {
             .verify(&presented.canonical_request, &signature)
             .map_err(|_| ClientAuthError::BadSignature)?;
 
-        // 3. Enforce the bounded ±skew timestamp window.
-        let now = Self::now_unix();
-        if (now - presented.timestamp).abs() > self.skew_secs {
+        // 3. Enforce the bounded ±skew timestamp window. A request is admitted
+        //    iff its timestamp is fresh relative to `now`.
+        if !is_fresh(now, presented.timestamp, self.skew_secs) {
             return Err(ClientAuthError::Replay);
         }
 
-        // 4. Replay check + nonce recording, with eviction of stale entries.
-        let cutoff = now - self.skew_secs;
+        // 4. Replay check + nonce recording, with eviction. An entry is retained
+        //    exactly while a replay carrying its timestamp would still pass the
+        //    step-3 admission window (`is_replayable`, derived from the same `now`
+        //    and `skew`). This closes the trailing-edge replay slot: a recorded
+        //    nonce is never evicted while a replay of it would still be admitted,
+        //    and no longer-replayable entry lingers — keeping the cache bounded.
         let mut cache = self
             .seen_nonces
             .lock()
             .map_err(|_| ClientAuthError::Storage("nonce cache poisoned".into()))?;
-        // Evict entries older than the window so the cache stays bounded.
-        cache.retain(|e| e.timestamp >= cutoff);
+        cache.retain(|e| is_replayable(now, e.timestamp, self.skew_secs));
         if cache
             .iter()
             .any(|e| e.client_id == presented.client_id && e.nonce == presented.nonce)
@@ -594,6 +652,124 @@ mod tests {
         let future = TofuClientAuth::now_unix() + DEFAULT_SKEW_SECS + 60;
         let pf = presented(&sk, &cred.client_id, future, "future-nonce");
         assert!(matches!(s.verify(&pf), Err(ClientAuthError::Replay)));
+    }
+
+    #[test]
+    fn nonce_not_evictable_while_replay_still_fresh() {
+        // Regression for the freshness/eviction boundary mismatch: a nonce admitted
+        // at timestamp T must keep being rejected as Replay for the ENTIRE window
+        // during which a replay of it would still pass the ±skew freshness check —
+        // i.e. it must never be evicted one tick early, opening a trailing-edge slot.
+        let skew = 300;
+        let store: Arc<dyn PersistenceProvider> = Arc::new(SqliteStore::in_memory().unwrap());
+        let s = TofuClientAuth::with_skew(store, skew).unwrap();
+        let key = s.issue_bootstrap_key().unwrap();
+        let sk = keypair();
+        let cred = enroll_with(&s, &key, &sk);
+
+        // Admit a request at timestamp T, with "now" == T.
+        let t = 1_000_000_000;
+        let p = presented(&sk, &cred.client_id, t, "edge-nonce");
+        assert!(s.verify_at(&p, t).is_ok(), "initial request must be accepted");
+
+        // For every "now" across the whole window in which a replay of timestamp T
+        // is STILL freshness-valid (|now - T| <= skew, i.e. now <= T + skew), the
+        // exact same (client_id, nonce) replay must be rejected as Replay — proving
+        // the entry was not evicted while still replayable.
+        for now in t..=t + skew {
+            assert!(
+                is_fresh(now, t, skew),
+                "test precondition: timestamp T must be fresh at now={now}"
+            );
+            assert!(
+                matches!(s.verify_at(&p, now), Err(ClientAuthError::Replay)),
+                "replay of T must stay rejected as Replay at now={now} (window still fresh)"
+            );
+        }
+
+        // One tick past the window the replay is no longer admissible, so it is
+        // rejected on freshness grounds (still Replay) and the entry may be evicted —
+        // either way no fresh replay is ever admitted.
+        let past = t + skew + 1;
+        assert!(!is_fresh(past, t, skew));
+        assert!(matches!(
+            s.verify_at(&p, past),
+            Err(ClientAuthError::Replay)
+        ));
+    }
+
+    #[test]
+    fn future_dated_nonce_survives_backward_clock_step() {
+        // The retention predicate must be trailing-edge only (`now - ts <= skew`),
+        // NOT the symmetric admission window. Otherwise a future-dated entry admitted
+        // at the leading edge would be wrongly evicted if `now` ever stepped backward
+        // (clock correction), reopening a replay slot while the replay is still
+        // admissible.
+        let skew = 300;
+        let store: Arc<dyn PersistenceProvider> = Arc::new(SqliteStore::in_memory().unwrap());
+        let s = TofuClientAuth::with_skew(store, skew).unwrap();
+        let key = s.issue_bootstrap_key().unwrap();
+        let sk = keypair();
+        let cred = enroll_with(&s, &key, &sk);
+
+        // Admit a FUTURE-dated request: ts = now0 + skew (leading edge of admission).
+        let now0 = 1_000_000_000;
+        let ts = now0 + skew;
+        let p = presented(&sk, &cred.client_id, ts, "future-edge");
+        assert!(s.verify_at(&p, now0).is_ok(), "future-dated request must be admitted");
+
+        // Clock steps BACKWARD to a point where the future-dated ts is OUTSIDE the
+        // symmetric admission window (now < ts - skew), so the symmetric `is_fresh`
+        // eviction predicate WOULD drop the entry here — but a trailing-edge-only
+        // retention keeps it. At this `now` the replay is itself rejected on
+        // freshness grounds; the danger is eviction now followed by recovery.
+        let back = ts - skew - 100; // now < ts - skew  ⇒ is_fresh(back, ts) == false
+        assert!(!is_fresh(back, ts, skew), "precondition: symmetric window would evict");
+        assert!(is_replayable(back, ts, skew), "precondition: still trailing-edge retainable");
+        // Replay at the backward `now` is rejected (Replay): freshness fails AND, with
+        // correct trailing-edge retention, the entry is still present.
+        assert!(matches!(s.verify_at(&p, back), Err(ClientAuthError::Replay)));
+
+        // Clock recovers to an in-window `now`: the replay is now admissible by
+        // freshness, so the ONLY thing rejecting it is the still-present nonce entry.
+        // If the backward step had evicted it (symmetric predicate), this replay would
+        // be wrongly admitted.
+        let recovered = now0;
+        assert!(is_fresh(recovered, ts, skew), "precondition: replay admissible again");
+        assert!(
+            matches!(s.verify_at(&p, recovered), Err(ClientAuthError::Replay)),
+            "future-dated nonce must survive a backward clock step (trailing-edge retention)"
+        );
+    }
+
+    #[test]
+    fn out_of_range_timestamp_is_rejected_not_panicking() {
+        // Attacker-controlled timestamps at the extremes of i64 must be rejected via
+        // saturating arithmetic, never panic (`i64::MIN.abs()`) or wrap into the
+        // freshness window.
+        let skew = 300;
+        let store: Arc<dyn PersistenceProvider> = Arc::new(SqliteStore::in_memory().unwrap());
+        let s = TofuClientAuth::with_skew(store, skew).unwrap();
+        let key = s.issue_bootstrap_key().unwrap();
+        let sk = keypair();
+        let cred = enroll_with(&s, &key, &sk);
+
+        for ts in [i64::MIN, i64::MIN + 1, i64::MAX, i64::MAX - 1] {
+            let p = presented(&sk, &cred.client_id, ts, "extreme");
+            assert!(
+                matches!(s.verify_at(&p, TofuClientAuth::now_unix()), Err(ClientAuthError::Replay)),
+                "extreme timestamp {ts} must be rejected as Replay"
+            );
+        }
+        // The pure predicates must not panic at the extremes either.
+        assert!(!is_fresh(0, i64::MIN, skew));
+        assert!(!is_fresh(0, i64::MAX, skew));
+        // Far-past ts: now - ts saturates to i64::MAX (> skew) → not replayable, evicted.
+        assert!(!is_replayable(0, i64::MIN, skew));
+        // Far-future ts: now - ts saturates to i64::MIN (<= skew) → still "replayable",
+        // but such an entry can never have been admitted (is_fresh rejects it), so it
+        // never enters the cache; harmless.
+        assert!(is_replayable(0, i64::MAX, skew));
     }
 
     #[test]

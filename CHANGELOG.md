@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Replay protection: align the nonce-cache retention window with the timestamp
+  freshness window so no recorded `(client_id, nonce)` is evictable while a replay
+  of it would still pass the ±skew admission check. Retention is now trailing-edge
+  only (`now - ts <= skew`), which also keeps a future-dated entry across a
+  backward clock step. Timestamp arithmetic is saturating, so an out-of-range
+  attacker-supplied timestamp is rejected without panicking or wrapping into the
+  window. Adds regression tests for the trailing-edge, backward-clock, and
+  extreme-timestamp cases.
+
 ## 0.1.0
 
 Initial release.
