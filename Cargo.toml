@@ -1,0 +1,19 @@
+[package]
+name = "wyrtloom-clientauth-tofu"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+wyrtloom-core = { path = "../wyrtloom/crates/core" }
+# git fallback (commented): wyrtloom-core = { git = "https://github.com/codepilots/wyrtloom.git", rev = "<sha>" }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+sha2 = "0.10"
+rand = "0.8"
+subtle = "2"          # constant-time comparison
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+[dev-dependencies]
+wyrtloom-store-sqlite = { path = "../wyrtloom-store-sqlite" }
