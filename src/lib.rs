@@ -54,7 +54,7 @@ use wyrtloom_core::types::Timestamp;
 
 /// Domain-separation tag mixed into every canonical request. Bumping this version
 /// hard-invalidates signatures built by older clients.
-pub const DOMAIN_TAG: &[u8] = b"wyrtloom-client-auth-v1";
+pub const DOMAIN_TAG: &[u8] = wyrtloom_core::client_auth::CLIENT_AUTH_DOMAIN.as_bytes();
 
 /// Collection holding pinned client identities.
 const CLIENTS: &str = "clients";
@@ -254,12 +254,10 @@ fn is_replayable(now: i64, ts: i64, skew: i64) -> bool {
     now.saturating_sub(ts) <= skew
 }
 
-/// Build the canonical, signed request bytes. **Every field is length-prefixed**
-/// (4-byte big-endian length + bytes) under the [`DOMAIN_TAG`], so field-boundary
-/// confusion is impossible and clients and the server derive identical bytes.
-///
-/// Layout: `DOMAIN_TAG || lp(method) || lp(path) || lp(body_sha256) || lp(client_id)
-/// || lp(timestamp_ascii) || lp(nonce)`.
+/// Build the canonical, signed request bytes. Delegates to the core contract
+/// function [`wyrtloom_core::client_auth::canonical_request`] so that clients, the
+/// `ClientAuthScheme` verifier, and the API server all derive byte-identical input
+/// from one shared, audited length-prefix encoder (no per-crate reinvention).
 pub fn canonicalize(
     method: &str,
     path: &str,
@@ -268,21 +266,9 @@ pub fn canonicalize(
     timestamp: i64,
     nonce: &str,
 ) -> Vec<u8> {
-    let mut out = Vec::new();
-    push_field(&mut out, DOMAIN_TAG);
-    push_field(&mut out, method.as_bytes());
-    push_field(&mut out, path.as_bytes());
-    push_field(&mut out, body_sha256);
-    push_field(&mut out, client_id.as_bytes());
-    push_field(&mut out, timestamp.to_string().as_bytes());
-    push_field(&mut out, nonce.as_bytes());
-    out
-}
-
-/// Append `len(field) as u32 BE || field` to `buf`.
-fn push_field(buf: &mut Vec<u8>, field: &[u8]) {
-    buf.extend_from_slice(&(field.len() as u32).to_be_bytes());
-    buf.extend_from_slice(field);
+    wyrtloom_core::client_auth::canonical_request(
+        method, path, body_sha256, client_id, timestamp, nonce,
+    )
 }
 
 impl ClientAuthScheme for TofuClientAuth {
