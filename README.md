@@ -46,14 +46,33 @@ distinct from the human user.
    let identity = scheme.verify(&PresentedClientAuth { /* … */ })?;
    ```
 
-   `verify` checks the ed25519 signature, enforces a bounded ±skew timestamp
-   window, and rejects replayed `(client_id, nonce)` pairs within that window.
+   `verify` checks the signature, enforces a bounded ±skew timestamp window, and
+   rejects replayed `(client_id, nonce)` pairs within that window.
+
+## Signing requirements (every client must follow)
+
+The public key's encoding selects the algorithm (no separate field):
+
+| Key | Encoding (the bytes you enroll) | Signature |
+|-----|---------------------------------|-----------|
+| **ed25519** | 32-byte raw public key | 64-byte raw — no extra requirements (ed25519 is deterministic) |
+| **ECDSA P-256** | 65-byte SEC1 **uncompressed** (`0x04 ‖ X ‖ Y`) | 64-byte raw `r‖s` (P1363), and **MUST be canonical low-s** |
+
+> **P-256 low-s is mandatory.** ECDSA signatures are malleable — `(r, s)` and
+> `(r, n−s)` both verify — so `verify` rejects high-s signatures (`s > n/2`) to
+> keep the encoding canonical. Most ECDSA producers (including **WebCrypto
+> `crypto.subtle.sign('ECDSA', …)`**) emit high-s ~50% of the time and do **not**
+> normalize, so a client MUST normalize before sending: if `s > n/2`, replace `s`
+> with `n − s` (leave `r` unchanged). Forgetting this yields intermittent ~50%
+> `BadSignature` rejections. The reference browser client does this in
+> `wyrtloom-dashboard-web/src/crypto/clientKey.ts` (`normalizeLowS`).
 
 ## Canonicalization
 
-[`canonicalize`] length-prefixes every field (4-byte big-endian length + bytes)
-under the domain-separation tag `wyrtloom-client-auth-v1`, so clients and the API
-server build identical signed bytes and field-boundary confusion is impossible.
+[`canonicalize`] (which delegates to `wyrtloom_core::client_auth::canonical_request`)
+length-prefixes every field (**8-byte big-endian** length + bytes) under the
+domain-separation tag `wyrtloom-client-auth-v1`, so clients and the API server
+build byte-identical signed bytes and field-boundary confusion is impossible.
 
 ## Security
 
@@ -63,6 +82,8 @@ server build identical signed bytes and field-boundary confusion is impossible.
 - Length-prefixed, domain-separated canonicalization.
 - Bounded ±skew replay window with nonce eviction (cache is O(window·rate)).
 - TOFU rejects key changes (`PinMismatch`).
+- ed25519 and ECDSA P-256 supported; P-256 signatures must be canonical low-s
+  (anti-malleability) — see "Signing requirements" above.
 
 ## License
 
